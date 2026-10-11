@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse
 
 from core import storage
 from core.auth_utils import require_user, err, SECRET_KEY, ALGORITHM
-from core.quiz_bank import get_quiz, QUIZ_BANK
+from core.quiz_bank import get_quiz, QUIZ_BANK, missing_required_sections
 
 ATTEMPT_TOKEN_TYP = "quiz_attempt"
 SECONDS_PER_QUESTION = 40
@@ -147,6 +147,12 @@ async def start_quiz(request: Request):
     if not quiz:
         return err(404, "Unknown quiz_id.")
 
+    if quiz.get("required_sections"):
+        missing = missing_required_sections(quiz, await storage.get_progress(user_id))
+        if missing:
+            return JSONResponse({"detail": "Complete the required course sections first.",
+                                 "missing_sections": missing}, status_code=403)
+
     questions = quiz["questions"]
     rng = secrets.SystemRandom()
 
@@ -166,6 +172,8 @@ async def start_quiz(request: Request):
                 "index": pos,
                 "q": q["q"],
                 "options": [q["options"][i] for i in perm],
+                "topic": q.get("topic"),
+                "difficulty": q.get("difficulty"),
             }
         )
 
@@ -203,6 +211,12 @@ async def submit_quiz(request: Request):
     if not quiz:
         return err(404, "Unknown quiz_id.")
 
+    if quiz.get("required_sections"):
+        missing = missing_required_sections(quiz, await storage.get_progress(user_id))
+        if missing:
+            return JSONResponse({"detail": "Complete the required course sections first.",
+                                 "missing_sections": missing}, status_code=403)
+
     try:
         body = await request.json()
     except Exception:
@@ -229,6 +243,10 @@ async def submit_quiz(request: Request):
     if len(answers) != len(order):
         return err(400, f"Expected {len(order)} answers, got {len(answers)}.")
 
+    if any(answer is not None and (type(answer) is not int or answer < 0
+           or answer >= len(opt_perm[pos])) for pos, answer in enumerate(answers)):
+        return err(400, "Each answer must be a valid option index or null.")
+
     review = []
     score = 0
     for pos, q_idx in enumerate(order):
@@ -251,8 +269,9 @@ async def submit_quiz(request: Request):
         )
 
     total = len(order)
-    pct = round((score / total) * 100) if total else 0
-    passed = pct >= MIN_PASS_PERCENT
+    pct = round((score / total) * 100, 2) if total else 0
+    threshold = quiz.get("min_pass_percent", MIN_PASS_PERCENT)
+    passed = total > 0 and score * 100 >= threshold * total
 
     # Best score per quiz (used for certificate eligibility)...
     await storage.save_quiz_score(user_id, quiz_id, score, total)
@@ -265,7 +284,7 @@ async def submit_quiz(request: Request):
             "total": total,
             "pct": pct,
             "passed": passed,
-            "min_pass_percent": MIN_PASS_PERCENT,
+            "min_pass_percent": threshold,
             "review": review,
         }
     )

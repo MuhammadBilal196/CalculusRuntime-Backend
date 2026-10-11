@@ -25,6 +25,7 @@ from core.auth_utils import require_user, err, SECRET_KEY, ALGORITHM
 from core import qr_utils
 from core import pdf_utils
 from core import storage
+from core.quiz_bank import get_quiz, missing_required_sections
 
 CERT_TOKEN_EXPIRE_DAYS = int(os.getenv("CERT_TOKEN_EXPIRE_DAYS", "3650"))
 FRONTEND_VERIFY_URL = os.getenv(
@@ -100,7 +101,17 @@ async def generate_certificate(request: Request):
     full_name = (body.get("full_name") or "").strip() or username
 
     quiz_id = (body.get("quiz_id") or "").strip() or None
-    min_quiz_score = int(body.get("min_quiz_score") or DEFAULT_MIN_QUIZ_SCORE)
+    if course_id == "linear-algebra":
+        quiz_id = "quiz-linear-algebra"
+        quiz = get_quiz(quiz_id)
+        course_title = "Linear Algebra"
+        min_quiz_score = quiz["min_pass_percent"]
+        missing = missing_required_sections(quiz, await storage.get_progress(user_id))
+        if missing:
+            return JSONResponse({"detail": "Complete the required course sections first.",
+                                 "missing_sections": missing}, status_code=403)
+    else:
+        min_quiz_score = int(body.get("min_quiz_score") or DEFAULT_MIN_QUIZ_SCORE)
 
     score = None
     total = None
@@ -110,8 +121,8 @@ async def generate_certificate(request: Request):
         if not attempt or not attempt.get("total"):
             return err(403, "You haven't passed this course's certification quiz yet.")
         score, total = attempt["score"], attempt["total"]
-        pct = round(score / total * 100)
-        if pct < min_quiz_score:
+        pct = round(score / total * 100, 2)
+        if score * 100 < min_quiz_score * total:
             return err(
                 403,
                 f"Quiz score {pct}% is below the required {min_quiz_score}%.",

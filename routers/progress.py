@@ -279,7 +279,108 @@ async def set_leaderboard_opt_in_route(request: Request):
     return JSONResponse({"ok": True, "leaderboardOptIn": opted})
 
 
+def validate_learning_event(body):
+    """Allowlist the shared v1 record. History never changes course/quiz scores."""
+    from datetime import datetime
+    def text(value, limit):
+        return isinstance(value, str) and 0 < len(value.strip()) <= limit
+    if not isinstance(body, dict) or set(body) != {"eventId", "kind", "data"}:
+        raise ValueError("eventId, kind and data are required.")
+    if not text(body["eventId"], 200) or not isinstance(body["data"], dict):
+        raise ValueError("Invalid event identifier or data.")
+    data = body["data"]
+    when = data.get("occurredAt")
+    if not text(when, 40):
+        raise ValueError("An ISO timestamp is required.")
+    try:
+        parsed = datetime.fromisoformat(when.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError()
+    except ValueError:
+        raise ValueError("Timestamp must include a timezone.")
+    if body["kind"] == "flashcard":
+        if set(data) != {"cardId", "rating", "occurredAt"} or not text(data.get("cardId"), 500):
+            raise ValueError("Invalid flashcard record.")
+        if data.get("rating") not in ("Again", "Good", "Easy"):
+            raise ValueError("Unknown review rating.")
+    elif body["kind"] == "note":
+        required = {"noteId", "sectionId", "courseId", "title", "path", "text", "quote", "deleted", "occurredAt"}
+        if set(data) != required:
+            raise ValueError("Invalid note schema.")
+        for key in ("noteId", "sectionId", "courseId", "title"):
+            if not text(data[key], 500):
+                raise ValueError("Invalid note identifier.")
+        path = data["path"]
+        if not text(path, 2000) or not path.startswith("/") or path.startswith("//") or "\\" in path or any(ord(c) < 32 for c in path):
+            raise ValueError("Only local section links are allowed.")
+        if type(data["deleted"]) is not bool or not isinstance(data["text"], str) or len(data["text"]) > 10000 or not isinstance(data["quote"], str) or len(data["quote"]) > 2000:
+            raise ValueError("Invalid note content.")
+        if not data["deleted"] and not (data["text"].strip() or data["quote"].strip()):
+            raise ValueError("A note or highlight is required.")
+    elif body["kind"] == "question":
+        required = {"schemaVersion", "attemptId", "responseId", "source", "courseId", "quizId",
+                    "questionId", "prompt", "options", "selectedIndex", "correctIndex", "correct",
+                    "grading", "topic", "difficulty", "occurredAt"}
+        if set(data) != required or (type(data["schemaVersion"]) is not int or data["schemaVersion"] != 1):
+            raise ValueError("Unknown question schema.")
+        for key in ("attemptId", "responseId", "quizId", "questionId"):
+            if not text(data[key], 500):
+                raise ValueError("Invalid question identifier.")
+        if not text(data["prompt"], 10000):
+            raise ValueError("Invalid question prompt.")
+        options = data["options"]
+        if not isinstance(options, list) or not 2 <= len(options) <= 8 or not all(text(v, 5000) for v in options):
+            raise ValueError("Invalid options.")
+        for key in ("selectedIndex", "correctIndex"):
+            value = data[key]
+            if key == "selectedIndex" and value is None:
+                continue
+            if type(value) is not int or not 0 <= value < len(options):
+                raise ValueError("Invalid answer index.")
+        if type(data["correct"]) is not bool or data["correct"] != (data["selectedIndex"] == data["correctIndex"]):
+            raise ValueError("Answer outcome does not match displayed indices.")
+        if data["source"] not in ("guide", "practice", "certificate") or data["grading"] not in ("client", "server-review"):
+            raise ValueError("Invalid question source.")
+        if data["difficulty"] not in (None, "Easy", "Medium", "Hard"):
+            raise ValueError("Invalid difficulty.")
+        for key in ("courseId", "topic"):
+            if data[key] is not None and not text(data[key], 500):
+                raise ValueError("Invalid course/topic.")
+    else:
+        raise ValueError("Unknown learning event kind.")
+    return body
+
+
+async def learning_events(request):
+    from core import storage
+    import json
+    user_id = require_user(request)
+    if not user_id:
+        return err(401, "Not authenticated.")
+    if request.method == "GET":
+        try:
+            after = int(request.query_params.get("after", "0"))
+            if after < 0 or after > 9007199254740991:
+                raise ValueError()
+        except (ValueError, TypeError):
+            return err(400, "after must be a nonnegative cursor.")
+        rows = await storage.list_learning_events(user_id, after)
+        return JSONResponse({"items": rows, "next_cursor": rows[-1]["id"] if len(rows) == 200 else None})
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > 65536:
+            return err(413, "Learning event exceeds 64 KiB.")
+    try:
+        event = validate_learning_event(json.loads(raw))
+        row = await storage.append_learning_event(user_id, event)
+    except (ValueError, TypeError, KeyError) as exc:
+        return err(400, str(exc))
+    return JSONResponse(row, status_code=201)
+
+
 routes = [
+    Route("/learning-events", learning_events, methods=["GET", "POST"]),
     Route("/",                       get_progress_route, methods=["GET"]),
     Route("/summary",                get_full_progress,  methods=["GET"]),   # ← Objective 19
     Route("/section/complete",       mark_complete,      methods=["POST"]),

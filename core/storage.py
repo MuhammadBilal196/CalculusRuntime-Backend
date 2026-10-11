@@ -822,3 +822,36 @@ if USE_SUPABASE:
             .execute()
         )
         _data(resp)
+
+
+# Learning events are untrusted study history, never certification evidence.
+async def append_learning_event(user_id: int, event: dict) -> dict:
+    import json
+    payload = json.dumps(event, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    if USE_SUPABASE:
+        def write():
+            _data(_supabase.table("learning_events").upsert(
+                {"user_id": user_id, "event_id": event["eventId"], "payload": payload},
+                on_conflict="user_id,event_id", ignore_duplicates=True).execute())
+            return _first(_supabase.table("learning_events").select("id,payload")
+                          .eq("user_id", user_id).eq("event_id", event["eventId"]).execute())
+        row = await asyncio.to_thread(write)
+    else:
+        await db.execute("INSERT INTO learning_events(user_id,event_id,payload) VALUES (?,?,?) "
+                         "ON CONFLICT(user_id,event_id) DO NOTHING", (user_id, event["eventId"], payload))
+        row = await db.fetchone("SELECT id,payload FROM learning_events WHERE user_id=? AND event_id=?",
+                                (user_id, event["eventId"]))
+    if not row or row["payload"] != payload:
+        raise ValueError("An event ID cannot be reused with different content.")
+    return {"id": row["id"], "event": json.loads(row["payload"])}
+
+
+async def list_learning_events(user_id: int, after: int = 0) -> list:
+    import json
+    if USE_SUPABASE:
+        rows = await asyncio.to_thread(lambda: _data(_supabase.table("learning_events")
+            .select("id,payload").eq("user_id", user_id).gt("id", after).order("id").limit(200).execute()))
+    else:
+        rows = await db.fetchall("SELECT id,payload FROM learning_events WHERE user_id=? AND id>? "
+                                 "ORDER BY id LIMIT 200", (user_id, after))
+    return [{"id": row["id"], "event": json.loads(row["payload"])} for row in (rows or [])]
