@@ -16,6 +16,7 @@ The backend is the CalcVoyager persistence API. It owns user accounts, JWT authe
 | File | Purpose |
 | --- | --- |
 | `README.md` | Backend overview and navigation |
+| `RUN.md` | Start, verify, and stop the backend locally |
 | `ARCHITECTURE.md` | Starlette app structure, routing, storage abstraction |
 | `API_REFERENCE.md` | Backend endpoint contracts |
 | `DATA_AND_AUTH.md` | Database schema, Supabase mapping, JWT/password flow |
