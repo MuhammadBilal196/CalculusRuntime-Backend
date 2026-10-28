@@ -95,7 +95,20 @@ CREATE TABLE IF NOT EXISTS user_prefs (
     user_id              INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     leaderboard_opt_in   INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS user_courses (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course_id   TEXT    NOT NULL,
+    enrolled_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    UNIQUE(user_id, course_id)
+);
 """
+
+# Columns added after the first release. Older databases get them on startup.
+MIGRATIONS = [
+    ("users", "full_name", "ALTER TABLE users ADD COLUMN full_name TEXT"),
+]
 
 
 # ── Synchronous helpers (run inside to_thread) ────────────────────────────────
@@ -111,6 +124,10 @@ def _connect() -> sqlite3.Connection:
 def _init_db_sync():
     conn = _connect()
     conn.executescript(SCHEMA)
+    for table, column, statement in MIGRATIONS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(statement)
     conn.commit()
     conn.close()
 
