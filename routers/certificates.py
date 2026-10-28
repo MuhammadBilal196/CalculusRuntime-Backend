@@ -98,7 +98,9 @@ async def generate_certificate(request: Request):
 
     profile = await storage.get_user_profile(user_id)
     username = (profile or {}).get("username") or f"user-{user_id}"
-    full_name = (body.get("full_name") or "").strip() or username
+    # Prefer the name sent with the claim, then the full name saved on the profile.
+    profile_name = " ".join(str((profile or {}).get("full_name") or "").split())
+    full_name = (body.get("full_name") or "").strip() or profile_name or username
 
     quiz_id = (body.get("quiz_id") or "").strip() or None
     if course_id == "linear-algebra":
