@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 from datetime import datetime, timezone
 
 from . import db
+from .points import compute_points
 
 
 DB_BACKEND = (
@@ -92,16 +93,29 @@ async def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
     if USE_SUPABASE:
         return await asyncio.to_thread(_get_user_by_username_supabase, username)
     return await db.fetchone(
-        "SELECT id, username, hashed_pw FROM users WHERE username = ?", (username,)
+        "SELECT id, username, full_name, email, hashed_pw FROM users WHERE username = ?",
+        (username,),
     )
 
 
-async def create_user(username: str, email: Optional[str], hashed_pw: str) -> int:
+async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    if not email:
+        return None
     if USE_SUPABASE:
-        return await asyncio.to_thread(_create_user_supabase, username, email, hashed_pw)
+        return await asyncio.to_thread(_get_user_by_email_supabase, email)
+    return await db.fetchone("SELECT id, username FROM users WHERE email = ?", (email,))
+
+
+async def create_user(
+    username: str, email: Optional[str], hashed_pw: str, full_name: Optional[str] = None
+) -> int:
+    if USE_SUPABASE:
+        return await asyncio.to_thread(
+            _create_user_supabase, username, email, hashed_pw, full_name
+        )
     return await db.execute(
-        "INSERT INTO users (username, email, hashed_pw) VALUES (?, ?, ?)",
-        (username, email, hashed_pw),
+        "INSERT INTO users (username, email, hashed_pw, full_name) VALUES (?, ?, ?, ?)",
+        (username, email, hashed_pw, full_name),
     )
 
 
@@ -109,7 +123,58 @@ async def get_user_profile(user_id: int) -> Optional[Dict[str, Any]]:
     if USE_SUPABASE:
         return await asyncio.to_thread(_get_user_profile_supabase, user_id)
     return await db.fetchone(
-        "SELECT id, username, email, created_at FROM users WHERE id = ?", (user_id,)
+        "SELECT id, username, full_name, email, created_at FROM users WHERE id = ?",
+        (user_id,),
+    )
+
+
+async def update_user_profile(
+    user_id: int, full_name: Optional[str], email: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Update the editable profile fields. None leaves a field unchanged."""
+    if USE_SUPABASE:
+        return await asyncio.to_thread(
+            _update_user_profile_supabase, user_id, full_name, email
+        )
+    if full_name is not None:
+        await db.execute(
+            "UPDATE users SET full_name = ? WHERE id = ?", (full_name or None, user_id)
+        )
+    if email is not None:
+        await db.execute("UPDATE users SET email = ? WHERE id = ?", (email or None, user_id))
+    return await get_user_profile(user_id)
+
+
+# ── Registered courses ────────────────────────────────────────────────────────
+
+
+async def list_user_courses(user_id: int) -> list[Dict[str, Any]]:
+    if USE_SUPABASE:
+        return await asyncio.to_thread(_list_user_courses_supabase, user_id)
+    rows = await db.fetchall(
+        "SELECT course_id, enrolled_at FROM user_courses WHERE user_id = ? "
+        "ORDER BY enrolled_at ASC",
+        (user_id,),
+    )
+    return [{"courseId": r["course_id"], "enrolledAt": r["enrolled_at"]} for r in rows]
+
+
+async def add_user_course(user_id: int, course_id: str) -> None:
+    if USE_SUPABASE:
+        return await asyncio.to_thread(_add_user_course_supabase, user_id, course_id)
+    await db.execute(
+        "INSERT INTO user_courses (user_id, course_id) VALUES (?, ?) "
+        "ON CONFLICT(user_id, course_id) DO NOTHING",
+        (user_id, course_id),
+    )
+
+
+async def remove_user_course(user_id: int, course_id: str) -> None:
+    if USE_SUPABASE:
+        return await asyncio.to_thread(_remove_user_course_supabase, user_id, course_id)
+    await db.execute(
+        "DELETE FROM user_courses WHERE user_id = ? AND course_id = ?",
+        (user_id, course_id),
     )
 
 
@@ -348,38 +413,98 @@ async def set_leaderboard_opt_in(user_id: int, opt_in: bool) -> bool:
     return bool(opt_in)
 
 
+def _certification_ids() -> set:
+    try:
+        from .quiz_bank import QUIZ_BANK
+
+        return set(QUIZ_BANK.keys())
+    except Exception:
+        return set()
+
+
 def _leaderboard_entry(
-    user_id: int, username: str, topics: Any, quiz_count: Any, quiz_pct: Any
+    user_id: int,
+    username: str,
+    full_name: Optional[str],
+    quiz_rows: list,
+    sections_completed: int,
+    certificates: int,
+    courses: int = 0,
+    certification_ids: Optional[set] = None,
 ) -> Dict[str, Any]:
-    return {
+    entry = {
         "userId": int(user_id),
-        "label": username or "Unknown",
-        "topics": int(topics or 0),
-        "quizCount": int(quiz_count or 0),
-        "quizPct": int(round(quiz_pct or 0)),
+        "username": username or "Unknown",
+        "fullName": (full_name or "").strip() or None,
+        "label": (full_name or "").strip() or username or "Unknown",
+        "courses": int(courses or 0),
     }
+    entry.update(
+        compute_points(quiz_rows, sections_completed, certificates, certification_ids)
+    )
+    return entry
+
+
+def _sort_leaderboard(entries: list) -> list:
+    entries.sort(key=lambda e: (-e["points"], -e["quizPct"], e["label"].lower()))
+    for index, entry in enumerate(entries):
+        entry["rank"] = index + 1
+    return entries
 
 
 async def get_leaderboard() -> list[Dict[str, Any]]:
-    """Stats for every user who opted in to the leaderboard."""
+    """Points and stats for every user who opted in, highest points first."""
     if USE_SUPABASE:
         return await asyncio.to_thread(_get_leaderboard_supabase)
-    rows = await db.fetchall(
-        "SELECT u.id AS user_id, u.username, "
-        "  (SELECT COUNT(*) FROM sections s WHERE s.user_id = u.id AND s.completed = 1) AS topics, "
-        "  (SELECT COUNT(*) FROM quiz_scores q WHERE q.user_id = u.id) AS quiz_count, "
-        "  (SELECT AVG(q.score * 100.0 / q.total) FROM quiz_scores q "
-        "     WHERE q.user_id = u.id AND q.total > 0) AS quiz_pct "
-        "FROM users u "
-        "JOIN user_prefs p ON p.user_id = u.id "
-        "WHERE p.leaderboard_opt_in = 1"
+    users = await db.fetchall(
+        "SELECT u.id AS user_id, u.username, u.full_name FROM users u "
+        "JOIN user_prefs p ON p.user_id = u.id WHERE p.leaderboard_opt_in = 1"
     )
-    return [
-        _leaderboard_entry(
-            row["user_id"], row["username"], row["topics"], row["quiz_count"], row["quiz_pct"]
-        )
-        for row in rows
-    ]
+    if not users:
+        return []
+    ids = [u["user_id"] for u in users]
+    marks = ",".join("?" for _ in ids)
+    quiz_rows = await db.fetchall(
+        f"SELECT user_id, quiz_id, score, total FROM quiz_scores WHERE user_id IN ({marks})",
+        tuple(ids),
+    )
+    section_rows = await db.fetchall(
+        f"SELECT user_id, COUNT(*) AS n FROM sections WHERE completed = 1 "
+        f"AND user_id IN ({marks}) GROUP BY user_id",
+        tuple(ids),
+    )
+    cert_rows = await db.fetchall(
+        f"SELECT user_id, COUNT(*) AS n FROM certificates WHERE user_id IN ({marks}) "
+        f"GROUP BY user_id",
+        tuple(ids),
+    )
+    course_rows = await db.fetchall(
+        f"SELECT user_id, COUNT(*) AS n FROM user_courses WHERE user_id IN ({marks}) "
+        f"GROUP BY user_id",
+        tuple(ids),
+    )
+    quizzes: Dict[int, list] = {}
+    for row in quiz_rows:
+        quizzes.setdefault(row["user_id"], []).append(row)
+    sections = {r["user_id"]: r["n"] for r in section_rows}
+    certs = {r["user_id"]: r["n"] for r in cert_rows}
+    courses = {r["user_id"]: r["n"] for r in course_rows}
+    cert_ids = _certification_ids()
+    return _sort_leaderboard(
+        [
+            _leaderboard_entry(
+                u["user_id"],
+                u["username"],
+                u.get("full_name"),
+                quizzes.get(u["user_id"], []),
+                sections.get(u["user_id"], 0),
+                certs.get(u["user_id"], 0),
+                courses.get(u["user_id"], 0),
+                cert_ids,
+            )
+            for u in users
+        ]
+    )
 
 
 async def log_solver_use(
@@ -435,6 +560,7 @@ async def _get_progress_sqlite(user_id: int) -> Dict[str, Any]:
         "bookmarks": await list_bookmarks(user_id),
         "solverUses": solver_count,
         "leaderboardOptIn": await get_leaderboard_opt_in(user_id),
+        "courses": await list_user_courses(user_id),
     }
 
 
@@ -454,35 +580,97 @@ def _bookmark_json(row: Dict[str, Any]) -> Dict[str, Any]:
 
 if USE_SUPABASE:
 
+    def _select_user(columns: str, fallback: str, column: str, value: Any):
+        """Select a user row; works before the full_name column is added."""
+        try:
+            return _first(
+                _supabase.from_("users").select(columns).eq(column, value).limit(1).execute()
+            )
+        except Exception:
+            return _first(
+                _supabase.from_("users").select(fallback).eq(column, value).limit(1).execute()
+            )
+
     def _get_user_by_username_supabase(username: str) -> Optional[Dict[str, Any]]:
-        resp = (
-            _supabase.from_("users")
-            .select("id,username,hashed_pw")
-            .eq("username", username)
-            .limit(1)
-            .execute()
+        return _select_user(
+            "id,username,full_name,email,hashed_pw", "id,username,email,hashed_pw", "username", username
         )
-        return _first(resp)
+
+    def _get_user_by_email_supabase(email: str) -> Optional[Dict[str, Any]]:
+        return _first(
+            _supabase.from_("users").select("id,username").eq("email", email).limit(1).execute()
+        )
 
     def _create_user_supabase(
-        username: str, email: Optional[str], hashed_pw: str
+        username: str, email: Optional[str], hashed_pw: str, full_name: Optional[str] = None
     ) -> int:
         payload = {"username": username, "email": email, "hashed_pw": hashed_pw}
-        resp = _supabase.from_("users").insert(payload).execute()
+        if full_name:
+            payload["full_name"] = full_name
+        try:
+            resp = _supabase.from_("users").insert(payload).execute()
+        except Exception:
+            if "full_name" not in payload:
+                raise
+            payload.pop("full_name")
+            resp = _supabase.from_("users").insert(payload).execute()
         rows = _data(resp) or []
         if not rows:
             raise RuntimeError("Supabase did not return the created user.")
         return int(rows[0]["id"])
 
     def _get_user_profile_supabase(user_id: int) -> Optional[Dict[str, Any]]:
-        resp = (
-            _supabase.from_("users")
-            .select("id,username,email,created_at")
-            .eq("id", user_id)
-            .limit(1)
+        return _select_user(
+            "id,username,full_name,email,created_at", "id,username,email,created_at", "id", user_id
+        )
+
+    def _update_user_profile_supabase(
+        user_id: int, full_name: Optional[str], email: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        payload: Dict[str, Any] = {}
+        if full_name is not None:
+            payload["full_name"] = full_name or None
+        if email is not None:
+            payload["email"] = email or None
+        if payload:
+            _data(_supabase.from_("users").update(payload).eq("id", user_id).execute())
+        return _get_user_profile_supabase(user_id)
+
+    def _list_user_courses_supabase(user_id: int) -> list[Dict[str, Any]]:
+        try:
+            resp = (
+                _supabase.from_("user_courses")
+                .select("course_id,enrolled_at")
+                .eq("user_id", user_id)
+                .order("enrolled_at")
+                .execute()
+            )
+        except Exception:
+            return []
+        return [
+            {"courseId": r["course_id"], "enrolledAt": r.get("enrolled_at")}
+            for r in (_data(resp) or [])
+        ]
+
+    def _add_user_course_supabase(user_id: int, course_id: str) -> None:
+        _data(
+            _supabase.from_("user_courses")
+            .upsert(
+                {"user_id": user_id, "course_id": course_id},
+                on_conflict="user_id,course_id",
+                ignore_duplicates=True,
+            )
             .execute()
         )
-        return _first(resp)
+
+    def _remove_user_course_supabase(user_id: int, course_id: str) -> None:
+        _data(
+            _supabase.from_("user_courses")
+            .delete()
+            .eq("user_id", user_id)
+            .eq("course_id", course_id)
+            .execute()
+        )
 
     def _get_progress_supabase(user_id: int) -> Dict[str, Any]:
         section_resp = (
@@ -518,6 +706,7 @@ if USE_SUPABASE:
             "bookmarks": _list_bookmarks_supabase(user_id),
             "solverUses": getattr(solver_resp, "count", 0) or 0,
             "leaderboardOptIn": _get_leaderboard_opt_in_supabase(user_id),
+            "courses": _list_user_courses_supabase(user_id),
         }
 
     def _mark_section_complete_supabase(user_id: int, section_id: str) -> Optional[int]:
@@ -752,51 +941,62 @@ if USE_SUPABASE:
         if not user_ids:
             return []
 
-        users_resp = (
-            _supabase.from_("users")
-            .select("id,username")
-            .in_("id", user_ids)
-            .execute()
-        )
-        usernames = {row["id"]: row["username"] for row in (_data(users_resp) or [])}
+        try:
+            users_resp = (
+                _supabase.from_("users")
+                .select("id,username,full_name")
+                .in_("id", user_ids)
+                .execute()
+            )
+        except Exception:
+            users_resp = (
+                _supabase.from_("users").select("id,username").in_("id", user_ids).execute()
+            )
+        users = {row["id"]: row for row in (_data(users_resp) or [])}
 
-        sections_resp = (
-            _supabase.from_("sections")
-            .select("user_id")
-            .in_("user_id", user_ids)
-            .eq("completed", True)
-            .execute()
-        )
-        topic_counts: Dict[int, int] = {}
-        for row in _data(sections_resp) or []:
-            topic_counts[row["user_id"]] = topic_counts.get(row["user_id"], 0) + 1
+        def count_by_user(table: str, extra=None) -> Dict[int, int]:
+            try:
+                query = _supabase.from_(table).select("user_id").in_("user_id", user_ids)
+                if extra:
+                    query = extra(query)
+                rows = _data(query.execute()) or []
+            except Exception:
+                return {}
+            counts: Dict[int, int] = {}
+            for row in rows:
+                counts[row["user_id"]] = counts.get(row["user_id"], 0) + 1
+            return counts
+
+        sections = count_by_user("sections", lambda q: q.eq("completed", True))
+        certs = count_by_user("certificates")
+        courses = count_by_user("user_courses")
 
         quiz_resp = (
             _supabase.from_("quiz_scores")
-            .select("user_id,score,total")
+            .select("user_id,quiz_id,score,total")
             .in_("user_id", user_ids)
             .execute()
         )
-        quiz_pcts: Dict[int, list] = {}
+        quizzes: Dict[int, list] = {}
         for row in _data(quiz_resp) or []:
-            if row.get("total"):
-                quiz_pcts.setdefault(row["user_id"], []).append(
-                    row["score"] * 100.0 / row["total"]
-                )
+            quizzes.setdefault(row["user_id"], []).append(row)
 
-        entries = []
-        for uid in user_ids:
-            pcts = quiz_pcts.get(uid, [])
-            entries.append(
+        cert_ids = _certification_ids()
+        return _sort_leaderboard(
+            [
                 _leaderboard_entry(
                     uid,
-                    usernames.get(uid, "?"),
-                    topic_counts.get(uid, 0),
-                    len(pcts),
-                    sum(pcts) / len(pcts) if pcts else 0,
+                    (users.get(uid) or {}).get("username", "?"),
+                    (users.get(uid) or {}).get("full_name"),
+                    quizzes.get(uid, []),
+                    sections.get(uid, 0),
+                    certs.get(uid, 0),
+                    courses.get(uid, 0),
+                    cert_ids,
                 )
-            )
-        return entries
+                for uid in user_ids
+            ]
+        )
 
     def _get_leaderboard_opt_in_supabase(user_id: int) -> bool:
         try:
