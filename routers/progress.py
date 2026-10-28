@@ -11,6 +11,9 @@ from core.storage import (
     mark_section_complete,
     unmark_section_complete,
     set_leaderboard_opt_in,
+    list_user_courses,
+    add_user_course,
+    remove_user_course,
 )
 from core.auth_utils import require_user, err
 
@@ -279,6 +282,48 @@ async def set_leaderboard_opt_in_route(request: Request):
     return JSONResponse({"ok": True, "leaderboardOptIn": opted})
 
 
+KNOWN_COURSES = {
+    "calculus-analytical-geometry",
+    "multivariable-calculus",
+    "linear-algebra",
+    "probability-statistics",
+}
+
+
+async def list_courses_route(request: Request):
+    """GET /api/progress/courses — the courses this user registered for."""
+    user_id = require_user(request)
+    if not user_id:
+        return err(401, "Not authenticated.")
+    return JSONResponse({"courses": await list_user_courses(user_id)})
+
+
+async def add_course_route(request: Request):
+    """POST /api/progress/courses {course_id} — register for a course."""
+    user_id = require_user(request)
+    if not user_id:
+        return err(401, "Not authenticated.")
+    try:
+        body = await request.json()
+    except Exception:
+        return err(400, "Invalid JSON.")
+    course_id = (body.get("course_id") or body.get("courseId") or "").strip()
+    if course_id not in KNOWN_COURSES:
+        return err(400, "Unknown course.")
+    await add_user_course(user_id, course_id)
+    return JSONResponse({"courses": await list_user_courses(user_id)}, status_code=201)
+
+
+async def remove_course_route(request: Request):
+    """DELETE /api/progress/courses/{course_id} — leave a course (progress is kept)."""
+    user_id = require_user(request)
+    if not user_id:
+        return err(401, "Not authenticated.")
+    course_id = request.path_params.get("course_id", "")
+    await remove_user_course(user_id, course_id)
+    return JSONResponse({"courses": await list_user_courses(user_id)})
+
+
 def validate_learning_event(body):
     """Allowlist the shared v1 record. History never changes course/quiz scores."""
     from datetime import datetime
@@ -390,4 +435,7 @@ routes = [
     Route("/section/{section_id}", unmark_complete, methods=["DELETE"]),
     Route("/leaderboard", get_leaderboard_route, methods=["GET"]),
     Route("/leaderboard", set_leaderboard_opt_in_route, methods=["POST"]),
+    Route("/courses", list_courses_route, methods=["GET"]),
+    Route("/courses", add_course_route, methods=["POST"]),
+    Route("/courses/{course_id}", remove_course_route, methods=["DELETE"]),
 ]
