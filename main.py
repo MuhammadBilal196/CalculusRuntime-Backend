@@ -4,6 +4,7 @@ Works on Python 3.10+ including 3.14.
 No pydantic, no aiosqlite, no SQLAlchemy.
 """
 
+import logging
 import os
 import sys
 import warnings
@@ -38,14 +39,28 @@ from routers.solver_proxy import routes as solver_routes
 from routers.certificates import routes as certificate_routes, list_my_certificates
 from routers.verification import routes as verification_routes
 
-# Calculus AI Chatbot routes (submodule) — serves /api/chat/*
-_CHATBOT_ROOT = Path(__file__).resolve().parent.parent / "Calculus-AI-Chatbot"
+# Calculus AI Chatbot routes — serves /api/chat/* (the site's "Ask tutor").
+# The chatbot is a separate repo. By default it is expected next to this one
+# (../Calculus-AI-Chatbot); set CHATBOT_DIR to load it from somewhere else,
+# e.g. a submodule or a folder copied into the deploy image.
+_CHATBOT_ROOT = Path(
+    os.getenv("CHATBOT_DIR")
+    or Path(__file__).resolve().parent.parent / "Calculus-AI-Chatbot"
+).resolve()
 if _CHATBOT_ROOT.is_dir() and str(_CHATBOT_ROOT) not in sys.path:
     sys.path.insert(0, str(_CHATBOT_ROOT))
 try:
     from backend.app.routes.chat import routes as chat_routes  # noqa: E402
     from backend.app.database.db import init_db as init_chat_db  # noqa: E402
-except ImportError:
+except ImportError as exc:
+    # Without this warning a missing chatbot only shows up as a 404 on
+    # /api/chat and the website's tutor silently stops answering.
+    logging.getLogger(__name__).warning(
+        "Ask Tutor disabled: could not load the chatbot from %s (%s). "
+        "Set CHATBOT_DIR to the Calculus-AI-Chatbot folder.",
+        _CHATBOT_ROOT,
+        exc,
+    )
     chat_routes = []
     init_chat_db = None
 
@@ -240,7 +255,8 @@ _DEFAULT_ORIGINS = (
     "http://localhost:5173,http://127.0.0.1:5173,"
     "https://calculus-runtime-frontend-ten.vercel.app,"
     "https://calculus-runtime-frontend-lyart.vercel.app,"
-    "https://calculus.quantumlogiclimited.com"
+    "https://calculus.quantumlogiclimited.com,"
+    "https://calculus.quantumlogicslimited.com"
 )
 _EXTRA_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = list(dict.fromkeys(

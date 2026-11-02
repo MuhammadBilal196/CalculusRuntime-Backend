@@ -10,4 +10,6 @@ supabase==2.30.1
 segno==1.6.6
 fpdf2==2.8.7
 
-
+# Needed by the mounted Calculus-AI-Chatbot routes (/api/chat)
+aiosqlite==0.22.1
+httpx==0.28.1
