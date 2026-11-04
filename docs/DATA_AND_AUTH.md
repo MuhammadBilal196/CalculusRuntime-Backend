@@ -54,6 +54,29 @@ The schema disables row-level security on the custom app tables because this bac
 7. Protected requests send `Authorization: Bearer <token>`.
 8. `auth_utils.require_user` decodes the token and returns the user id.
 
+### Email verification
+
+New accounts must verify their email before they can open courses
+(`users.verification_required = 1`). Accounts created earlier keep
+`verification_required = 0` and can verify from their profile at any time.
+
+1. `POST /api/auth/signup` now requires `email`. It creates the user and sends
+   a 6-digit code plus a one-click link (`/verify-email?token=…` on the frontend).
+2. `POST /api/auth/verify-email/confirm` `{code}` (signed in) or
+   `POST /api/auth/verify-email/link` `{token}` (no sign-in needed) sets
+   `users.email_verified = 1`.
+3. `POST /api/auth/verify-email/send` `{email?}` resends (60 s cooldown) and can
+   change the address first. Changing the email via `PATCH /api/auth/me` resets
+   `email_verified`.
+4. Only keyed SHA-256 hashes of the code and link token are stored, in
+   `email_verifications` (one row per user). Codes expire after 15 minutes and
+   allow 5 wrong tries.
+
+Mail is sent with Resend (`RESEND_API_KEY`) or SMTP (`SMTP_HOST`, `SMTP_PORT`,
+`SMTP_USER`, `SMTP_PASSWORD`), from `EMAIL_FROM`. `FRONTEND_URL` sets where the
+link points. For local development `EMAIL_DEV_MODE=true` prints the code in the
+backend console and returns it to the frontend instead of emailing it.
+
 ## Authorization Rules
 
 | Resource | Rule |
