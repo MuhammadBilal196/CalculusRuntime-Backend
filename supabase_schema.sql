@@ -126,3 +126,21 @@ create table if not exists public.user_courses (
 );
 create index if not exists user_courses_user_id_idx on public.user_courses (user_id);
 alter table public.user_courses disable row level security;
+
+
+-- Email verification. Accounts created before this existed keep
+-- verification_required = false and can verify from their profile.
+alter table public.users add column if not exists email_verified boolean not null default false;
+alter table public.users add column if not exists verification_required boolean not null default false;
+
+-- One pending verification code/link per user. Only hashes are stored.
+create table if not exists public.email_verifications (
+  user_id bigint primary key references public.users(id) on delete cascade,
+  email text not null,
+  code_hash text not null,
+  token_hash text not null unique,
+  expires_at bigint not null,
+  sent_at bigint not null,
+  attempts integer not null default 0
+);
+alter table public.email_verifications disable row level security;
