@@ -93,7 +93,8 @@ async def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
     if USE_SUPABASE:
         return await asyncio.to_thread(_get_user_by_username_supabase, username)
     return await db.fetchone(
-        "SELECT id, username, full_name, email, hashed_pw FROM users WHERE username = ?",
+        "SELECT id, username, full_name, email, email_verified, verification_required, hashed_pw "
+        "FROM users WHERE username = ?",
         (username,),
     )
 
@@ -107,15 +108,20 @@ async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
 
 
 async def create_user(
-    username: str, email: Optional[str], hashed_pw: str, full_name: Optional[str] = None
+    username: str,
+    email: Optional[str],
+    hashed_pw: str,
+    full_name: Optional[str] = None,
+    verification_required: bool = False,
 ) -> int:
     if USE_SUPABASE:
         return await asyncio.to_thread(
-            _create_user_supabase, username, email, hashed_pw, full_name
+            _create_user_supabase, username, email, hashed_pw, full_name, verification_required
         )
     return await db.execute(
-        "INSERT INTO users (username, email, hashed_pw, full_name) VALUES (?, ?, ?, ?)",
-        (username, email, hashed_pw, full_name),
+        "INSERT INTO users (username, email, hashed_pw, full_name, verification_required) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (username, email, hashed_pw, full_name, 1 if verification_required else 0),
     )
 
 
@@ -123,7 +129,8 @@ async def get_user_profile(user_id: int) -> Optional[Dict[str, Any]]:
     if USE_SUPABASE:
         return await asyncio.to_thread(_get_user_profile_supabase, user_id)
     return await db.fetchone(
-        "SELECT id, username, full_name, email, created_at FROM users WHERE id = ?",
+        "SELECT id, username, full_name, email, email_verified, verification_required, created_at "
+        "FROM users WHERE id = ?",
         (user_id,),
     )
 
@@ -143,6 +150,65 @@ async def update_user_profile(
     if email is not None:
         await db.execute("UPDATE users SET email = ? WHERE id = ?", (email or None, user_id))
     return await get_user_profile(user_id)
+
+
+# ── Email verification ────────────────────────────────────────────────────────
+
+
+async def set_email_verified(user_id: int, verified: bool) -> None:
+    if USE_SUPABASE:
+        return await asyncio.to_thread(_set_email_verified_supabase, user_id, verified)
+    await db.execute(
+        "UPDATE users SET email_verified = ? WHERE id = ?", (1 if verified else 0, user_id)
+    )
+
+
+async def save_email_verification(
+    user_id: int, email: str, code_hash: str, token_hash: str, expires_at: int, sent_at: int
+) -> None:
+    """Replace the user's pending verification (one at a time)."""
+    if USE_SUPABASE:
+        return await asyncio.to_thread(
+            _save_email_verification_supabase,
+            user_id, email, code_hash, token_hash, expires_at, sent_at,
+        )
+    await db.execute(
+        "INSERT INTO email_verifications "
+        "(user_id, email, code_hash, token_hash, expires_at, sent_at, attempts) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0) "
+        "ON CONFLICT(user_id) DO UPDATE SET email = excluded.email, "
+        "code_hash = excluded.code_hash, token_hash = excluded.token_hash, "
+        "expires_at = excluded.expires_at, sent_at = excluded.sent_at, attempts = 0",
+        (user_id, email, code_hash, token_hash, expires_at, sent_at),
+    )
+
+
+async def get_email_verification(user_id: int) -> Optional[Dict[str, Any]]:
+    if USE_SUPABASE:
+        return await asyncio.to_thread(_get_email_verification_supabase, "user_id", user_id)
+    return await db.fetchone("SELECT * FROM email_verifications WHERE user_id = ?", (user_id,))
+
+
+async def get_email_verification_by_token(token_hash: str) -> Optional[Dict[str, Any]]:
+    if USE_SUPABASE:
+        return await asyncio.to_thread(_get_email_verification_supabase, "token_hash", token_hash)
+    return await db.fetchone(
+        "SELECT * FROM email_verifications WHERE token_hash = ?", (token_hash,)
+    )
+
+
+async def count_verification_attempt(user_id: int, attempts: int) -> None:
+    if USE_SUPABASE:
+        return await asyncio.to_thread(_count_verification_attempt_supabase, user_id, attempts)
+    await db.execute(
+        "UPDATE email_verifications SET attempts = ? WHERE user_id = ?", (attempts, user_id)
+    )
+
+
+async def delete_email_verification(user_id: int) -> None:
+    if USE_SUPABASE:
+        return await asyncio.to_thread(_delete_email_verification_supabase, user_id)
+    await db.execute("DELETE FROM email_verifications WHERE user_id = ?", (user_id,))
 
 
 # ── Registered courses ────────────────────────────────────────────────────────
@@ -580,16 +646,20 @@ def _bookmark_json(row: Dict[str, Any]) -> Dict[str, Any]:
 
 if USE_SUPABASE:
 
+    _VERIFY_COLUMNS = ",email_verified,verification_required"
+
     def _select_user(columns: str, fallback: str, column: str, value: Any):
-        """Select a user row; works before the full_name column is added."""
-        try:
-            return _first(
-                _supabase.from_("users").select(columns).eq(column, value).limit(1).execute()
-            )
-        except Exception:
-            return _first(
-                _supabase.from_("users").select(fallback).eq(column, value).limit(1).execute()
-            )
+        """Select a user row; works before the full_name / verification columns exist."""
+        attempts = [columns + _VERIFY_COLUMNS, columns, fallback]
+        for index, cols in enumerate(attempts):
+            try:
+                return _first(
+                    _supabase.from_("users").select(cols).eq(column, value).limit(1).execute()
+                )
+            except Exception:
+                if index == len(attempts) - 1:
+                    raise
+        return None
 
     def _get_user_by_username_supabase(username: str) -> Optional[Dict[str, Any]]:
         return _select_user(
@@ -602,17 +672,25 @@ if USE_SUPABASE:
         )
 
     def _create_user_supabase(
-        username: str, email: Optional[str], hashed_pw: str, full_name: Optional[str] = None
+        username: str,
+        email: Optional[str],
+        hashed_pw: str,
+        full_name: Optional[str] = None,
+        verification_required: bool = False,
     ) -> int:
         payload = {"username": username, "email": email, "hashed_pw": hashed_pw}
         if full_name:
             payload["full_name"] = full_name
+        if verification_required:
+            payload["verification_required"] = True
         try:
             resp = _supabase.from_("users").insert(payload).execute()
         except Exception:
-            if "full_name" not in payload:
+            # Older schema without the newer optional columns.
+            if "full_name" not in payload and "verification_required" not in payload:
                 raise
-            payload.pop("full_name")
+            payload.pop("full_name", None)
+            payload.pop("verification_required", None)
             resp = _supabase.from_("users").insert(payload).execute()
         rows = _data(resp) or []
         if not rows:
@@ -635,6 +713,50 @@ if USE_SUPABASE:
         if payload:
             _data(_supabase.from_("users").update(payload).eq("id", user_id).execute())
         return _get_user_profile_supabase(user_id)
+
+    def _set_email_verified_supabase(user_id: int, verified: bool) -> None:
+        _data(
+            _supabase.from_("users")
+            .update({"email_verified": bool(verified)})
+            .eq("id", user_id)
+            .execute()
+        )
+
+    def _save_email_verification_supabase(
+        user_id: int, email: str, code_hash: str, token_hash: str, expires_at: int, sent_at: int
+    ) -> None:
+        _data(
+            _supabase.from_("email_verifications")
+            .upsert(
+                {
+                    "user_id": user_id,
+                    "email": email,
+                    "code_hash": code_hash,
+                    "token_hash": token_hash,
+                    "expires_at": expires_at,
+                    "sent_at": sent_at,
+                    "attempts": 0,
+                },
+                on_conflict="user_id",
+            )
+            .execute()
+        )
+
+    def _get_email_verification_supabase(column: str, value: Any) -> Optional[Dict[str, Any]]:
+        return _first(
+            _supabase.from_("email_verifications").select("*").eq(column, value).limit(1).execute()
+        )
+
+    def _count_verification_attempt_supabase(user_id: int, attempts: int) -> None:
+        _data(
+            _supabase.from_("email_verifications")
+            .update({"attempts": attempts})
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+    def _delete_email_verification_supabase(user_id: int) -> None:
+        _data(_supabase.from_("email_verifications").delete().eq("user_id", user_id).execute())
 
     def _list_user_courses_supabase(user_id: int) -> list[Dict[str, Any]]:
         try:
