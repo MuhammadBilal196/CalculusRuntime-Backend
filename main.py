@@ -76,7 +76,7 @@ async def root(request: Request):
             "docs": "/docs",
             "health": "/api/health",
             "endpoints": {
-                "auth": "/api/auth  (POST /signup  POST /login  GET /me)",
+                "auth": "/api/auth  (POST /signup  POST /login  GET /me  PATCH /me  POST /verify-email/send|confirm|link)",
                 "progress": "/api/progress  (GET /  POST /section/complete  DELETE /section/{id})",
                 "bookmarks": "/api/bookmarks  (GET /  POST /  DELETE /{id})",
                 "quiz": "/api/quiz  (GET /  POST /)",
@@ -147,6 +147,15 @@ _DOCS_HTML = """<!DOCTYPE html>
   <div class="route"><span class="method get">GET</span>
     <div><div class="path">/api/auth/me</div>
     <div class="desc">🔒 Current user profile</div></div></div>
+  <div class="route"><span class="method post">POST</span>
+    <div><div class="path">/api/auth/verify-email/send</div>
+    <div class="desc">🔒 Email a 6-digit code + link. Body: <code>{"email?"}</code> (changes the address first)</div></div></div>
+  <div class="route"><span class="method post">POST</span>
+    <div><div class="path">/api/auth/verify-email/confirm</div>
+    <div class="desc">🔒 Verify with the code. Body: <code>{"code"}</code></div></div></div>
+  <div class="route"><span class="method post">POST</span>
+    <div><div class="path">/api/auth/verify-email/link</div>
+    <div class="desc">Verify from the email link. Body: <code>{"token"}</code></div></div></div>
 </div>
 
 <div class="group">
