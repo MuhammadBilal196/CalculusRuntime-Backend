@@ -103,11 +103,30 @@ CREATE TABLE IF NOT EXISTS user_courses (
     enrolled_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     UNIQUE(user_id, course_id)
 );
+
+-- One pending email-verification code/link per user. Only hashes are stored.
+CREATE TABLE IF NOT EXISTS email_verifications (
+    user_id     INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    email       TEXT    NOT NULL,
+    code_hash   TEXT    NOT NULL,
+    token_hash  TEXT    NOT NULL UNIQUE,
+    expires_at  INTEGER NOT NULL,
+    sent_at     INTEGER NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Columns added after the first release. Older databases get them on startup.
 MIGRATIONS = [
     ("users", "full_name", "ALTER TABLE users ADD COLUMN full_name TEXT"),
+    # Email verification. Accounts created before verification existed keep
+    # verification_required = 0, so they can verify from their profile when they like.
+    ("users", "email_verified", "ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0"),
+    (
+        "users",
+        "verification_required",
+        "ALTER TABLE users ADD COLUMN verification_required INTEGER NOT NULL DEFAULT 0",
+    ),
 ]
 
 
