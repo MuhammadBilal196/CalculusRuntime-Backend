@@ -15,7 +15,7 @@ Configure ONE of these in .env:
 
 For local development without a mail account set EMAIL_DEV_MODE=true: the
 code and link are printed in the backend console and returned to the
-frontend instead of being emailed. Never enable it in production.
+frontend instead of being emailed.
 """
 
 import asyncio
@@ -100,6 +100,23 @@ def verification_email(code: str, link: str, minutes: int, name: str = "") -> tu
     return subject, text, body
 
 
+def _send_smtp_port(host: str, port: int, user: str, password: str, msg: EmailMessage, timeout: int = 7) -> None:
+    context = ssl.create_default_context()
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, context=context, timeout=timeout) as server:
+            if user:
+                server.login(user, password)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=timeout) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            if user:
+                server.login(user, password)
+            server.send_message(msg)
+
+
 def _send_smtp(to: str, subject: str, text: str, body_html: str) -> None:
     host = _env("SMTP_HOST")
     port = int(_env("SMTP_PORT", "587") or 587)
@@ -113,26 +130,21 @@ def _send_smtp(to: str, subject: str, text: str, body_html: str) -> None:
     msg.set_content(text)
     msg.add_alternative(body_html, subtype="html")
 
-    context = ssl.create_default_context()
-    if port == 465:
-        with smtplib.SMTP_SSL(host, port, context=context, timeout=20) as server:
-            if user:
-                server.login(user, password)
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP(host, port, timeout=20) as server:
-            server.ehlo()
-            server.starttls(context=context)
-            server.ehlo()
-            if user:
-                server.login(user, password)
-            server.send_message(msg)
+    ports = [port, 465 if port != 465 else 587]
+    last_err = None
+    for candidate_port in ports:
+        try:
+            _send_smtp_port(host, candidate_port, user, password, msg, timeout=6)
+            return
+        except Exception as exc:
+            last_err = exc
+    raise last_err
 
 
 async def _send_resend(to: str, subject: str, text: str, body_html: str) -> None:
     import httpx
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         response = await client.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {_env('RESEND_API_KEY')}"},
