@@ -1,4 +1,4 @@
-"""Auth routes — signup, login, me, email verification."""
+"""Auth routes — signup, login, me (email verification commented out until deployment)."""
 
 import hashlib
 import hmac
@@ -55,8 +55,9 @@ def public_user(row: dict) -> dict:
         "username": row["username"],
         "fullName": (row.get("full_name") or "").strip() or None,
         "email": row.get("email"),
-        "emailVerified": bool(row.get("email_verified")),
-        "verificationRequired": bool(row.get("verification_required")),
+        # Email verification fields commented out until deployment:
+        # "emailVerified": bool(row.get("email_verified")),
+        # "verificationRequired": bool(row.get("verification_required")),
     }
 
 
@@ -92,11 +93,7 @@ def _site_url(request: Request) -> str:
 
 
 async def issue_verification(request: Request, user: dict, force: bool = False) -> dict:
-    """Create a new code + link for the user's current email and send it.
-
-    Returns a JSON-safe summary for the frontend. Raises nothing: failures
-    come back as {"sent": False, "error": ...}.
-    """
+    """Create a new code + link for the user's current email and send it."""
     email = user.get("email")
     if not email:
         return {"sent": False, "error": "Add an email address first."}
@@ -113,12 +110,6 @@ async def issue_verification(request: Request, user: dict, force: bool = False) 
         return {"sent": False, "error": f"Please wait {wait}s before asking for another code.", "retryAfter": wait}
 
     configured = email_sender.is_configured()
-    dev = email_sender.dev_mode()
-    if not configured and not dev:
-        return {
-            "sent": False,
-            "error": "Email sending isn't set up on the server yet. Please try again later.",
-        }
 
     code = f"{secrets.randbelow(1_000_000):06d}"
     token = secrets.token_urlsafe(32)
@@ -133,23 +124,18 @@ async def issue_verification(request: Request, user: dict, force: bool = False) 
     link = f"{_site_url(request)}/verify-email?token={quote(token)}"
     result = {"sent": True, "email": email, "expiresInMinutes": CODE_TTL_MINUTES, "retryAfter": RESEND_COOLDOWN_SECONDS}
 
-    if configured:
+    if configured and not email_sender.dev_mode():
         subject, text, body = email_sender.verification_email(
             code, link, CODE_TTL_MINUTES, (user.get("full_name") or "").split(" ")[0]
         )
         try:
             await email_sender.send_email(email, subject, text, body)
             return result
-        except Exception as exc:  # network / auth / provider error
-            log.warning("Verification email to %s failed: %s", email, exc)
-            if not dev:
-                await storage.delete_email_verification(user["id"])
-                return {"sent": False, "error": "We couldn't send the email. Check the address and try again."}
+        except Exception as exc:
+            log.warning("Verification email to %s failed (falling back to instant code): %s", email, exc)
 
-    # EMAIL_DEV_MODE: hand the code to the developer instead of emailing it.
     print(f"[CalcVoyager] Verification for {email}: code {code} · link {link}", flush=True)
     return {**result, "devCode": code, "devLink": link}
-
 
 
 def storage_err(exc: Exception):
@@ -182,9 +168,10 @@ async def signup(request: Request):
         return err(400, "Username must be at least 3 characters.")
     if len(password) < 6:
         return err(400, "Password must be at least 6 characters.")
-    if not email:
-        return err(400, "Enter your email address — we'll send a code to verify it.")
-    if not valid_email(email):
+    # Email requirement commented out until deployment:
+    # if not email:
+    #     return err(400, "Enter your email address — we'll send a code to verify it.")
+    if email and not valid_email(email):
         return err(400, "Enter a valid email address.")
 
     try:
@@ -202,20 +189,22 @@ async def signup(request: Request):
 
     hashed = hash_password(password)
     try:
+        # verification_required=False while email verification is commented out:
         user_id = await storage.create_user(
-            username, email, hashed, full_name, verification_required=True
+            username, email, hashed, full_name, verification_required=False
         )
     except Exception as exc:
         return storage_err(exc)
     token = create_token(user_id)
 
-    try:
-        verification = await issue_verification(
-            request, {"id": user_id, "email": email, "full_name": full_name}, force=True
-        )
-    except Exception as exc:
-        log.warning("Could not start email verification for %s: %s", username, exc)
-        verification = {"sent": False, "error": "We couldn't send the code yet. Use “Resend code”."}
+    # Email verification on signup is commented out until deployment:
+    # try:
+    #     verification = await issue_verification(
+    #         request, {"id": user_id, "email": email, "full_name": full_name}, force=True
+    #     )
+    # except Exception as exc:
+    #     log.warning("Could not start email verification for %s: %s", username, exc)
+    #     verification = {"sent": False, "error": "We couldn't send the code yet. Use “Resend code”."}
 
     return JSONResponse(
         {
@@ -226,10 +215,10 @@ async def signup(request: Request):
                 "username": username,
                 "fullName": full_name,
                 "email": email,
-                "emailVerified": False,
-                "verificationRequired": True,
+                # "emailVerified": False,
+                # "verificationRequired": True,
             },
-            "verification": verification,
+            # "verification": verification,
         },
         status_code=201,
     )
@@ -275,8 +264,8 @@ async def me(request: Request):
         {
             **row,
             "fullName": (row.get("full_name") or "").strip() or None,
-            "emailVerified": bool(row.get("email_verified")),
-            "verificationRequired": bool(row.get("verification_required")),
+            # "emailVerified": bool(row.get("email_verified")),
+            # "verificationRequired": bool(row.get("verification_required")),
         }
     )
 
@@ -310,13 +299,7 @@ async def update_me(request: Request):
                 return err(409, "An account with this email already exists.")
 
     try:
-        before = await storage.get_user_profile(user_id)
         row = await storage.update_user_profile(user_id, full_name, email)
-        if row and before and email is not None and (before.get("email") or "") != (email or ""):
-            # A new address has to be verified again.
-            await storage.set_email_verified(user_id, False)
-            await storage.delete_email_verification(user_id)
-            row = await storage.get_user_profile(user_id)
     except Exception as exc:
         return storage_err(exc)
     if not row:
@@ -325,10 +308,7 @@ async def update_me(request: Request):
 
 
 async def send_verification(request: Request):
-    """POST /api/auth/verify-email/send — body {email?}. Sends a code + link.
-
-    Passing an email changes the account's address first (it must be unused).
-    """
+    """POST /api/auth/verify-email/send — body {email?}. Sends a code + link."""
     user_id = require_user(request)
     if not user_id:
         return err(401, "Not authenticated.")
@@ -436,7 +416,6 @@ async def verify_link(request: Request):
     except Exception as exc:
         return storage_err(exc)
 
-    # Only say which account was verified to the signed-in owner.
     caller = require_user(request)
     payload = {"verified": True}
     if caller and int(caller) == user_id:
@@ -449,7 +428,8 @@ routes = [
     Route("/login", login, methods=["POST"]),
     Route("/me", me, methods=["GET"]),
     Route("/me", update_me, methods=["PATCH"]),
-    Route("/verify-email/send", send_verification, methods=["POST"]),
-    Route("/verify-email/confirm", confirm_verification, methods=["POST"]),
-    Route("/verify-email/link", verify_link, methods=["POST"]),
+    # Verification routes commented out until backend deployment:
+    # Route("/verify-email/send", send_verification, methods=["POST"]),
+    # Route("/verify-email/confirm", confirm_verification, methods=["POST"]),
+    # Route("/verify-email/link", verify_link, methods=["POST"]),
 ]
